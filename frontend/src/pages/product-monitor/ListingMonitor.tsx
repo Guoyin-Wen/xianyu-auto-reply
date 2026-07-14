@@ -11,6 +11,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Loader2,
+  MessageSquare,
   PackageSearch,
   Pencil,
   Play,
@@ -18,6 +19,7 @@ import {
   RefreshCw,
   Search,
   Square,
+  Tags,
   Trash2,
   Users,
   ShoppingCart,
@@ -30,12 +32,15 @@ import {
   MONITOR_TYPE_LABELS,
   type ListingMonitorTask,
 } from '@/api/listingMonitor'
+import { getListingMonitorCategories } from '@/api/listingMonitorCategory'
 import { ConfirmModal } from '@/components/common/ConfirmModal'
 import { PageLoading } from '@/components/common/Loading'
 import { useUIStore } from '@/store/uiStore'
 import { getApiErrorMessage } from '@/utils/apiError'
 import { ListingMonitorFormModal } from './ListingMonitorFormModal'
 import { BatchAccountsModal, type BatchAccountField } from './BatchAccountsModal'
+import { BatchCategoryModal } from './BatchCategoryModal'
+import { BatchDmContentModal } from './BatchDmContentModal'
 
 const formatPriceRange = (task: ListingMonitorTask): string => {
   const min = task.price_min
@@ -54,6 +59,7 @@ export function ListingMonitor() {
   const [deleting, setDeleting] = useState(false)
   const [tasks, setTasks] = useState<ListingMonitorTask[]>([])
   const [keyword, setKeyword] = useState('')
+  const [categoryId, setCategoryId] = useState<number | undefined>(undefined)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [total, setTotal] = useState(0)
@@ -63,14 +69,37 @@ export function ListingMonitor() {
   const [editingTask, setEditingTask] = useState<ListingMonitorTask | null>(null)
   const [batchDeleteConfirmOpen, setBatchDeleteConfirmOpen] = useState(false)
   const [batchAccountsField, setBatchAccountsField] = useState<BatchAccountField | null>(null)
+  const [showBatchCategory, setShowBatchCategory] = useState(false)
+  const [showBatchDmContent, setShowBatchDmContent] = useState(false)
+  const [categoryMap, setCategoryMap] = useState<Record<number, string>>({})
   const [statusUpdatingId, setStatusUpdatingId] = useState<number | null>(null)
   const [runningId, setRunningId] = useState<number | null>(null)
+
+  // 加载分类映射（用于列表展示分类名与筛选下拉；普通用户仅见自己的分类，管理员见全部）
+  useEffect(() => {
+    const loadCategories = async () => {
+      try {
+        const result = await getListingMonitorCategories()
+        if (result.success && result.data) {
+          const map: Record<number, string> = {}
+          result.data.forEach((c) => {
+            map[c.id] = c.name
+          })
+          setCategoryMap(map)
+        }
+      } catch {
+        // 分类加载失败不阻塞任务列表展示
+      }
+    }
+    void loadCategories()
+  }, [])
 
   const loadTasks = async (nextPage = page, nextPageSize = pageSize) => {
     try {
       setTableLoading(true)
       const result = await getListingMonitorTasks(nextPage, nextPageSize, {
         keyword: keyword.trim() || undefined,
+        categoryId,
       })
       if (!result.success || !result.data) {
         setTasks([])
@@ -108,6 +137,7 @@ export function ListingMonitor() {
 
   const handleReset = async () => {
     setKeyword('')
+    setCategoryId(undefined)
     if (page === 1) {
       try {
         setTableLoading(true)
@@ -254,11 +284,19 @@ export function ListingMonitor() {
             <>
               <button className="btn-ios-secondary" onClick={() => setBatchAccountsField('account_ids')} disabled={tableLoading || deleting}>
                 <Users className="w-4 h-4" />
-                批量改监控账号 ({selectedIds.size})
+                批量改采集账号 ({selectedIds.size})
               </button>
               <button className="btn-ios-secondary" onClick={() => setBatchAccountsField('order_account_ids')} disabled={tableLoading || deleting}>
                 <ShoppingCart className="w-4 h-4" />
                 批量改下单账号 ({selectedIds.size})
+              </button>
+              <button className="btn-ios-secondary" onClick={() => setShowBatchCategory(true)} disabled={tableLoading || deleting}>
+                <Tags className="w-4 h-4" />
+                批量改分类 ({selectedIds.size})
+              </button>
+              <button className="btn-ios-secondary" onClick={() => setShowBatchDmContent(true)} disabled={tableLoading || deleting}>
+                <MessageSquare className="w-4 h-4" />
+                批量改私信 ({selectedIds.size})
               </button>
               <button className="btn-ios-danger" onClick={() => setBatchDeleteConfirmOpen(true)} disabled={tableLoading || deleting}>
                 <Trash2 className="w-4 h-4" />
@@ -279,7 +317,7 @@ export function ListingMonitor() {
 
       <div className="vben-card">
         <div className="vben-card-body">
-          <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-[1fr_220px_auto] gap-3">
             <div className="input-group">
               <label className="input-label">商品关键字</label>
               <input
@@ -293,6 +331,21 @@ export function ListingMonitor() {
                   }
                 }}
               />
+            </div>
+            <div className="input-group">
+              <label className="input-label">分类</label>
+              <select
+                className="input-ios"
+                value={categoryId === undefined ? '' : String(categoryId)}
+                onChange={(e) => setCategoryId(e.target.value === '' ? undefined : Number(e.target.value))}
+              >
+                <option value="">全部分类</option>
+                {Object.entries(categoryMap).map(([id, name]) => (
+                  <option key={id} value={id}>
+                    {name}
+                  </option>
+                ))}
+              </select>
             </div>
             <div className="flex items-end gap-2">
               <button className="btn-ios-primary flex-1" onClick={() => void handleSearch()}>
@@ -330,6 +383,7 @@ export function ListingMonitor() {
                 </th>
                 <th>任务ID</th>
                 <th>监控类型</th>
+                <th>所属分类</th>
                 <th>所属用户</th>
                 <th>商品关键字</th>
                 <th>价格区间</th>
@@ -351,13 +405,13 @@ export function ListingMonitor() {
             <tbody>
               {tableLoading ? (
                 <tr>
-                  <td colSpan={19} className="text-center py-12">
+                  <td colSpan={20} className="text-center py-12">
                     <Loader2 className="w-6 h-6 animate-spin text-blue-500 mx-auto" />
                   </td>
                 </tr>
               ) : tasks.length === 0 ? (
                 <tr>
-                  <td colSpan={19} className="text-center py-12 text-slate-400">
+                  <td colSpan={20} className="text-center py-12 text-slate-400">
                     <div className="flex flex-col items-center gap-2">
                       <PackageSearch className="w-12 h-12 text-slate-300 dark:text-slate-600" />
                       <p>暂无监控任务，点击右上角新建</p>
@@ -381,6 +435,9 @@ export function ListingMonitor() {
                       <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
                         {MONITOR_TYPE_LABELS[item.monitor_type] || item.monitor_type}
                       </span>
+                    </td>
+                    <td className="whitespace-nowrap text-slate-600 dark:text-slate-300">
+                      {item.category_id != null ? (categoryMap[item.category_id] || `#${item.category_id}`) : '-'}
                     </td>
                     <td className="whitespace-nowrap text-slate-600 dark:text-slate-300">{item.owner_username || '-'}</td>
                     <td className="max-w-[220px] font-medium text-slate-800 dark:text-slate-100">
@@ -506,6 +563,28 @@ export function ListingMonitor() {
           onClose={() => setBatchAccountsField(null)}
           onSaved={async () => {
             setBatchAccountsField(null)
+            await loadTasks(page, pageSize)
+          }}
+        />
+      )}
+
+      {showBatchCategory && (
+        <BatchCategoryModal
+          taskIds={Array.from(selectedIds)}
+          onClose={() => setShowBatchCategory(false)}
+          onSaved={async () => {
+            setShowBatchCategory(false)
+            await loadTasks(page, pageSize)
+          }}
+        />
+      )}
+
+      {showBatchDmContent && (
+        <BatchDmContentModal
+          taskIds={Array.from(selectedIds)}
+          onClose={() => setShowBatchDmContent(false)}
+          onSaved={async () => {
+            setShowBatchDmContent(false)
             await loadTasks(page, pageSize)
           }}
         />

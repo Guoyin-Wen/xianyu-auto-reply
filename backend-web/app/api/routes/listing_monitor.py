@@ -29,6 +29,7 @@ class ListingMonitorCreateRequest(BaseModel):
     """创建上新监控任务请求"""
 
     monitor_type: str = Field(..., description="监控类型：listing-上新监控，price_drop-降价监控")
+    category_id: int = Field(..., description="所属分类ID（必填）")
     keyword: str = Field(..., min_length=1, max_length=200, description="商品监控关键字")
     price_min: Optional[float] = Field(None, ge=0, description="商品价格区间最低值")
     price_max: Optional[float] = Field(None, ge=0, description="商品价格区间最高值")
@@ -36,7 +37,7 @@ class ListingMonitorCreateRequest(BaseModel):
     interval_minutes: int = Field(..., ge=1, description="任务执行间隔（分钟）")
     collect_pages: int = Field(1, ge=1, description="每次采集页数")
     proxy_url: Optional[str] = Field(None, max_length=255, description="代理API地址（GET返回IP:PORT列表，空=不使用代理）")
-    account_ids: List[str] = Field(..., min_length=1, description="关联的闲鱼账号ID列表（至少一个）")
+    account_ids: List[str] = Field(default_factory=list, description="采集账号ID列表（多选，非必填；不可用时回退兜底）")
     order_account_ids: Optional[List[str]] = Field(None, description="下单账号ID列表（多选，私信与下单共用，非必填）")
     dm_content: Optional[str] = Field(None, max_length=1000, description="私信内容（配置下单账号后必填）")
     dm_batch_size: int = Field(5, ge=1, le=100, description="每次定时私信任务最多处理条数")
@@ -50,6 +51,7 @@ class ListingMonitorUpdateRequest(BaseModel):
     """更新上新监控任务请求"""
 
     monitor_type: Optional[str] = Field(None, description="监控类型：listing-上新监控，price_drop-降价监控")
+    category_id: Optional[int] = Field(None, description="所属分类ID")
     keyword: Optional[str] = Field(None, min_length=1, max_length=200)
     price_min: Optional[float] = Field(None, ge=0)
     price_max: Optional[float] = Field(None, ge=0)
@@ -83,8 +85,22 @@ class ListingMonitorBatchAccountsRequest(BaseModel):
     """批量修改上新监控任务账号请求"""
 
     ids: List[int] = Field(default_factory=list, description="监控任务ID列表")
-    field: str = Field(..., description="要修改的账号字段：account_ids-监控账号，order_account_ids-下单账号")
+    field: str = Field(..., description="要修改的账号字段：account_ids-采集账号，order_account_ids-下单账号")
     account_ids: List[str] = Field(default_factory=list, description="选择的账号ID列表")
+
+
+class ListingMonitorBatchCategoryRequest(BaseModel):
+    """批量修改上新监控任务分类请求"""
+
+    ids: List[int] = Field(default_factory=list, description="监控任务ID列表")
+    category_id: int = Field(..., description="目标分类ID（必填）")
+
+
+class ListingMonitorBatchDmContentRequest(BaseModel):
+    """批量修改上新监控任务私信内容请求"""
+
+    ids: List[int] = Field(default_factory=list, description="监控任务ID列表")
+    dm_content: str = Field(..., min_length=1, max_length=1000, description="私信内容（必填）")
 
 
 class ListingMonitorCopyCookiesRequest(BaseModel):
@@ -93,12 +109,19 @@ class ListingMonitorCopyCookiesRequest(BaseModel):
     ids: List[int] = Field(default_factory=list, description="监控日志ID列表")
 
 
+class ListingMonitorResetItemsDmRequest(BaseModel):
+    """批量重置采集商品私信失败状态请求"""
+
+    ids: List[int] = Field(default_factory=list, description="采集商品主键ID列表")
+
+
 @router.get("", response_model=ApiResponse)
 async def list_listing_monitor_tasks(
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, description="每页条数"),
     keyword: Optional[str] = Query(None, description="按关键字筛选"),
     is_enabled: Optional[bool] = Query(None, description="是否启用"),
+    category_id: Optional[int] = Query(None, description="按分类筛选"),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> Dict[str, Any]:
@@ -111,6 +134,7 @@ async def list_listing_monitor_tasks(
         page_size=page_size,
         keyword=keyword,
         is_enabled=is_enabled,
+        category_id=category_id,
     )
     return ApiResponse(success=True, message="查询成功", data=data)
 
@@ -239,10 +263,50 @@ async def batch_update_listing_monitor_accounts(
         success_count = await svc.batch_update_accounts(owner_id, req.ids, req.field, req.account_ids)
     except ValueError as exc:
         return ApiResponse(success=False, message=str(exc))
-    field_label = "监控账号" if req.field == "account_ids" else "下单账号"
+    field_label = "采集账号" if req.field == "account_ids" else "下单账号"
     return ApiResponse(
         success=True,
         message=f"成功为 {success_count} 条监控任务修改{field_label}",
+        data={"success_count": success_count, "total_count": len(req.ids)},
+    )
+
+
+@router.post("/batch-update-category", response_model=ApiResponse)
+async def batch_update_listing_monitor_category(
+    req: ListingMonitorBatchCategoryRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> Dict[str, Any]:
+    """批量修改监控任务的所属分类"""
+    owner_id, _ = resolve_owner_scope(current_user)
+    svc = ListingMonitorService(session)
+    try:
+        success_count = await svc.batch_update_category(owner_id, req.ids, req.category_id)
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
+    return ApiResponse(
+        success=True,
+        message=f"成功为 {success_count} 条监控任务修改分类",
+        data={"success_count": success_count, "total_count": len(req.ids)},
+    )
+
+
+@router.post("/batch-update-dm-content", response_model=ApiResponse)
+async def batch_update_listing_monitor_dm_content(
+    req: ListingMonitorBatchDmContentRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> Dict[str, Any]:
+    """批量修改监控任务的私信内容"""
+    owner_id, _ = resolve_owner_scope(current_user)
+    svc = ListingMonitorService(session)
+    try:
+        success_count = await svc.batch_update_dm_content(owner_id, req.ids, req.dm_content)
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
+    return ApiResponse(
+        success=True,
+        message=f"成功为 {success_count} 条监控任务修改私信内容",
         data={"success_count": success_count, "total_count": len(req.ids)},
     )
 
@@ -283,6 +347,27 @@ async def list_listing_monitor_logs(
     return ApiResponse(success=True, message="查询成功", data=data)
 
 
+@router.delete("/logs/clear", response_model=ApiResponse)
+async def clear_listing_monitor_logs(
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> Dict[str, Any]:
+    """清空监控日志（只清空10天前的数据，保留最近10天）"""
+    owner_id, _ = resolve_owner_scope(current_user)
+    svc = ListingMonitorService(session)
+    try:
+        data = await svc.clear_logs(owner_id)
+        deleted_count = data.get("deleted_count", 0)
+        return ApiResponse(
+            success=True,
+            message=f"已清空 {deleted_count} 条10天前的监控日志",
+            data=data,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await session.rollback()
+        return ApiResponse(success=False, message=f"清空监控日志失败: {exc}")
+
+
 @router.post("/logs/copy-cookies", response_model=ApiResponse)
 async def copy_listing_monitor_log_cookies(
     req: ListingMonitorCopyCookiesRequest,
@@ -312,7 +397,7 @@ async def list_listing_monitor_items(
     is_ordered: Optional[bool] = Query(None, description="是否已下单"),
     seller_fill: Optional[str] = Query(None, description="卖家补全状态：filled/pending/failed"),
     has_detail: Optional[bool] = Query(None, description="是否已获取详情"),
-    dm_state: Optional[str] = Query(None, description="私信状态：not_sent/pending/success/failed"),
+    dm_state: Optional[str] = Query(None, description="私信状态：not_sent/waiting/pending/success/failed"),
     order_state: Optional[str] = Query(None, description="下单状态：not_ordered/ordered/failed/no_account/duplicate"),
     created_start: Optional[str] = Query(None, description="采集时间区间开始（北京时间，如 2026-06-18T00:00）"),
     created_end: Optional[str] = Query(None, description="采集时间区间结束（北京时间，如 2026-06-18T23:59）"),
@@ -341,6 +426,26 @@ async def list_listing_monitor_items(
         created_end=created_end,
     )
     return ApiResponse(success=True, message="查询成功", data=data)
+
+
+@router.post("/items/reset-dm", response_model=ApiResponse)
+async def reset_listing_monitor_items_dm(
+    req: ListingMonitorResetItemsDmRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> Dict[str, Any]:
+    """批量将选中的"私信失败"采集商品重置为"未私信"，等待定时任务重试"""
+    owner_id, _ = resolve_owner_scope(current_user)
+    svc = ListingMonitorService(session)
+    try:
+        success_count = await svc.reset_items_dm_failed(owner_id, req.ids)
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
+    return ApiResponse(
+        success=True,
+        message=f"成功重置 {success_count} 条私信失败商品，等待定时任务重试",
+        data={"success_count": success_count, "total_count": len(req.ids)},
+    )
 
 
 @router.get("/items/{item_pk}", response_model=ApiResponse)

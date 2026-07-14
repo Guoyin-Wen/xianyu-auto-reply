@@ -34,6 +34,7 @@ import {
   ShoppingCart,
   Star,
   Store,
+  Tags,
   Ticket,
   Timer,
   UserCog,
@@ -110,7 +111,7 @@ export const mainNavItems: NavEntry[] = [
       { key: 'product-publish-materials', icon: Image, label: '素材库', path: '/product-publish/materials' },
       { key: 'product-publish-single', icon: Send, label: '单品发布', path: '/product-publish/single' },
       { key: 'product-publish-batch', icon: Layers, label: '批量发布', path: '/product-publish/batch' },
-      { key: 'product-publish-addresses', icon: MapPin, label: '随机地址库', path: '/product-publish/addresses' },
+      { key: 'product-publish-addresses', icon: MapPin, label: '地址库', path: '/product-publish/addresses' },
       { key: 'product-publish-logs', icon: ScrollText, label: '发布日志', path: '/product-publish/logs' },
     ],
   },
@@ -120,10 +121,12 @@ export const mainNavItems: NavEntry[] = [
     label: '商品监控',
     children: [
       { key: 'product-monitor-overview', icon: LayoutDashboard, label: '监控总览', path: '/product-monitor/overview' },
+      { key: 'product-monitor-categories', icon: Tags, label: '监控分类', path: '/product-monitor/categories' },
       { key: 'product-monitor-listing', icon: PackageSearch, label: '商品监控', path: '/product-monitor/listing' },
       { key: 'product-monitor-logs', icon: ScrollText, label: '监控日志', path: '/product-monitor/logs' },
       { key: 'product-monitor-items', icon: Package, label: '采集商品', path: '/product-monitor/items' },
       { key: 'product-monitor-order-fallback', icon: ShoppingCart, label: '下单账号', path: '/product-monitor/order-fallback-accounts' },
+      { key: 'product-monitor-collect-fallback', icon: Users, label: '采集账号', path: '/product-monitor/collect-fallback-accounts' },
     ],
   },
   { key: 'keywords', icon: MessageSquare, label: '自动回复', path: '/keywords' },
@@ -160,7 +163,16 @@ export const adminNavItems: NavEntry[] = [
   },
   { key: 'admin-scheduled-tasks', icon: Timer, label: '定时任务', path: '/admin/scheduled-tasks', adminOnly: true },
   { key: 'admin-announcements', icon: Megaphone, label: '公告管理', path: '/admin/announcements', adminOnly: true },
-  { key: 'admin-ad-manage', icon: Image, label: '广告管理', path: '/admin/ad-manage', adminOnly: true },
+  {
+    key: 'admin-advertising',
+    icon: Image,
+    label: '广告',
+    adminOnly: true,
+    children: [
+      { key: 'admin-ad-manage', icon: Image, label: '广告管理', path: '/admin/ad-manage', adminOnly: true },
+      { key: 'admin-popup-announcements', icon: Megaphone, label: '弹窗公告', path: '/admin/popup-announcements', adminOnly: true },
+    ],
+  },
   { key: 'admin-fund-flows', icon: Wallet, label: '资金流水', path: '/admin/fund-flows', adminOnly: true },
 ]
 

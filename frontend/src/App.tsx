@@ -35,6 +35,7 @@ const Settings = React.lazy(() => import('@/pages/settings/Settings').then(m => 
 const MessageFilters = React.lazy(() => import('@/pages/messageFilters/MessageFilters').then(m => ({ default: m.MessageFilters })))
 const Feedback = React.lazy(() => import('@/pages/feedback/Feedback'))
 const Announcements = React.lazy(() => import('@/pages/announcements/Announcements').then(m => ({ default: m.Announcements })))
+const PopupAnnouncements = React.lazy(() => import('@/pages/announcements/PopupAnnouncements').then(m => ({ default: m.PopupAnnouncements })))
 const AdManage = React.lazy(() => import('@/pages/advertisements/AdManage'))
 const AdApply = React.lazy(() => import('@/pages/advertisements/AdApply'))
 const Tutorial = React.lazy(() => import('@/pages/tutorial/Tutorial').then(m => ({ default: m.Tutorial })))
@@ -65,9 +66,11 @@ const PublishAddresses = React.lazy(() => import('@/pages/product-publish/Publis
 const PublishLogs = React.lazy(() => import('@/pages/product-publish/PublishLogs').then(m => ({ default: m.PublishLogs })))
 const ListingMonitor = React.lazy(() => import('@/pages/product-monitor/ListingMonitor').then(m => ({ default: m.ListingMonitor })))
 const MonitorOverview = React.lazy(() => import('@/pages/product-monitor/MonitorOverview').then(m => ({ default: m.MonitorOverview })))
+const MonitorCategory = React.lazy(() => import('@/pages/product-monitor/MonitorCategory').then(m => ({ default: m.MonitorCategory })))
 const MonitorLogs = React.lazy(() => import('@/pages/product-monitor/MonitorLogs').then(m => ({ default: m.MonitorLogs })))
 const MonitorItems = React.lazy(() => import('@/pages/product-monitor/MonitorItems').then(m => ({ default: m.MonitorItems })))
 const OrderFallbackAccount = React.lazy(() => import('@/pages/product-monitor/OrderFallbackAccount').then(m => ({ default: m.OrderFallbackAccount })))
+const CollectFallbackAccount = React.lazy(() => import('@/pages/product-monitor/CollectFallbackAccount').then(m => ({ default: m.CollectFallbackAccount })))
 
 // 管理员页面懒加载
 const Users = React.lazy(() => import('@/pages/admin/Users').then(m => ({ default: m.Users })))
@@ -365,10 +368,12 @@ function App() {
             <Route path="product-publish/logs" element={<PublishLogs />} />
             {/* 商品监控 */}
             <Route path="product-monitor/overview" element={<MonitorOverview />} />
+            <Route path="product-monitor/categories" element={<MonitorCategory />} />
             <Route path="product-monitor/listing" element={<ListingMonitor />} />
             <Route path="product-monitor/logs" element={<MonitorLogs />} />
             <Route path="product-monitor/items" element={<MonitorItems />} />
             <Route path="product-monitor/order-fallback-accounts" element={<OrderFallbackAccount />} />
+            <Route path="product-monitor/collect-fallback-accounts" element={<CollectFallbackAccount />} />
             <Route path="personal-settings" element={<PersonalSettings />} />
             <Route path="blacklist" element={<Blacklist />} />
             <Route path="settings" element={<Settings />} />
@@ -405,6 +410,7 @@ function App() {
             <Route path="admin/scheduled-tasks" element={<ScheduledTasks />} />
             <Route path="admin/announcements" element={<Announcements />} />
             <Route path="admin/ad-manage" element={<AdManage />} />
+            <Route path="admin/popup-announcements" element={<PopupAnnouncements />} />
           </Route>
 
           {/* Catch all */}

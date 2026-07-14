@@ -207,6 +207,13 @@ class DatabaseInitializer:
             "定时获取待发货订单并同步收货人姓名/手机号/地址等信息",
         ),
         (
+            "fetch_refund_orders",
+            "退款订单获取任务",
+            120,
+            True,
+            "定时获取退款订单数据，更新订单状态并触发退款订单注销",
+        ),
+        (
             "fetch_items",
             "获取闲鱼商品任务",
             1200,
@@ -718,21 +725,21 @@ class DatabaseInitializer:
         # 19. Goofish 定时抓取任务表
         "xy_goofish_crawl_jobs": """
             CREATE TABLE IF NOT EXISTS xy_goofish_crawl_jobs (
-                id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                owner_id BIGINT NOT NULL,
-                cookie_id VARCHAR(80) NOT NULL,
-                keyword VARCHAR(80) NOT NULL,
-                interval_seconds INT NOT NULL DEFAULT 900,
-                start_page INT NOT NULL DEFAULT 1,
-                pages INT NOT NULL DEFAULT 1,
-                page_size INT NOT NULL DEFAULT 20,
-                fetch_detail TINYINT(1) DEFAULT 1,
-                detail_limit INT NOT NULL DEFAULT 20,
-                enabled TINYINT(1) DEFAULT 1,
-                last_run_at DATETIME,
-                last_error TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
+                owner_id BIGINT NOT NULL COMMENT '归属用户ID',
+                cookie_id VARCHAR(80) NOT NULL COMMENT '账号标识',
+                keyword VARCHAR(80) NOT NULL COMMENT '抓取关键词',
+                interval_seconds INT NOT NULL DEFAULT 900 COMMENT '执行间隔(秒)',
+                start_page INT NOT NULL DEFAULT 1 COMMENT '起始页码',
+                pages INT NOT NULL DEFAULT 1 COMMENT '抓取页数',
+                page_size INT NOT NULL DEFAULT 20 COMMENT '每页数量',
+                fetch_detail TINYINT(1) DEFAULT 1 COMMENT '是否抓取详情',
+                detail_limit INT NOT NULL DEFAULT 20 COMMENT '抓取详情数量上限',
+                enabled TINYINT(1) DEFAULT 1 COMMENT '是否启用',
+                last_run_at DATETIME COMMENT '最近一次执行时间',
+                last_error TEXT COMMENT '最近一次错误信息',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
                 INDEX idx_owner_id (owner_id),
                 INDEX idx_cookie_id (cookie_id),
                 INDEX idx_enabled (enabled)
@@ -742,22 +749,22 @@ class DatabaseInitializer:
         # 20. Goofish 定时抓取商品表
         "xy_goofish_crawl_items": """
             CREATE TABLE IF NOT EXISTS xy_goofish_crawl_items (
-                id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                job_id BIGINT NOT NULL,
-                item_id VARCHAR(64) NOT NULL,
-                title TEXT,
-                price VARCHAR(64),
-                area VARCHAR(120),
-                seller_name VARCHAR(120),
-                item_url TEXT,
-                main_image VARCHAR(512),
-                publish_time VARCHAR(64),
-                want_count INT,
-                view_count INT,
-                description TEXT,
-                detail_error VARCHAR(255),
-                raw_json JSON,
-                fetched_at DATETIME NOT NULL,
+                id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
+                job_id BIGINT NOT NULL COMMENT '关联的抓取任务ID',
+                item_id VARCHAR(64) NOT NULL COMMENT '闲鱼商品ID',
+                title TEXT COMMENT '商品标题',
+                price VARCHAR(64) COMMENT '商品价格',
+                area VARCHAR(120) COMMENT '所在地区',
+                seller_name VARCHAR(120) COMMENT '卖家昵称',
+                item_url TEXT COMMENT '商品链接',
+                main_image VARCHAR(512) COMMENT '主图URL',
+                publish_time VARCHAR(64) COMMENT '发布时间',
+                want_count INT COMMENT '想要人数',
+                view_count INT COMMENT '浏览次数',
+                description TEXT COMMENT '商品描述',
+                detail_error VARCHAR(255) COMMENT '详情抓取错误信息',
+                raw_json JSON COMMENT '原始数据JSON',
+                fetched_at DATETIME NOT NULL COMMENT '抓取时间',
                 UNIQUE KEY uk_job_item (job_id, item_id),
                 INDEX idx_job_id (job_id),
                 INDEX idx_fetched_at (fetched_at)
@@ -795,7 +802,21 @@ class DatabaseInitializer:
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='公告信息表';
         """,
-        
+
+        # 22.1 弹窗公告表（用户每次登录时弹窗展示）
+        "xy_popup_announcements": """
+            CREATE TABLE IF NOT EXISTS xy_popup_announcements (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '弹窗公告ID',
+                title VARCHAR(200) NOT NULL COMMENT '公告标题',
+                content TEXT NOT NULL COMMENT '公告内容',
+                link VARCHAR(500) NULL COMMENT '跳转链接',
+                is_enabled TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否启用',
+                is_deleted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否已删除',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='弹窗公告表';
+        """,
+
         # 23. 确认收货消息表
         "xy_confirm_receipt_messages": """
             CREATE TABLE IF NOT EXISTS xy_confirm_receipt_messages (
@@ -1280,7 +1301,8 @@ class DatabaseInitializer:
                 INDEX idx_arml_status_created (process_status, created_at),
                 INDEX idx_arml_status_strategy_created (process_status, reply_strategy, created_at),
                 INDEX idx_arml_strategy_created (reply_strategy, created_at),
-                INDEX idx_arml_order_strategy_id (order_no, reply_strategy, id)
+                INDEX idx_arml_order_strategy_id (order_no, reply_strategy, id),
+                INDEX idx_arml_strategy_order_id (reply_strategy, order_no, id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='自动回复消息日志表';
         """,
 
@@ -1304,6 +1326,21 @@ class DatabaseInitializer:
                 INDEX idx_pa_enabled_account (is_enabled, account_id),
                 INDEX idx_pa_sort_created (sort_order, created_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='商品发布随机地址池表';
+        """,
+
+        "xy_user_publish_addresses": """
+            CREATE TABLE IF NOT EXISTS xy_user_publish_addresses (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
+                owner_id BIGINT NOT NULL COMMENT '归属用户ID',
+                address VARCHAR(200) NOT NULL COMMENT '地址文本（去重键）',
+                is_deleted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否已删除（软删除）',
+                use_count INT NOT NULL DEFAULT 0 COMMENT '使用次数',
+                last_used_at DATETIME DEFAULT NULL COMMENT '最后使用时间',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                INDEX idx_upa_owner_deleted (owner_id, is_deleted),
+                INDEX idx_upa_owner_addr (owner_id, address)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='个人发布地址库表';
         """,
 
         # 38. 商品发布日志表
@@ -1336,10 +1373,26 @@ class DatabaseInitializer:
         """,
 
         # 45.1 商品上新监控任务表
+        # 45.1 商品监控分类表
+        "xy_listing_monitor_categories": """
+            CREATE TABLE IF NOT EXISTS xy_listing_monitor_categories (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
+                owner_id BIGINT NOT NULL COMMENT '归属用户ID',
+                name VARCHAR(100) NOT NULL COMMENT '分类名称',
+                is_deleted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否已删除（软删除）',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                INDEX idx_lmc_owner (owner_id),
+                INDEX idx_lmc_owner_deleted (owner_id, is_deleted)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='商品监控分类表';
+        """,
+
+        # 45.2 商品监控任务表
         "xy_listing_monitor_tasks": """
             CREATE TABLE IF NOT EXISTS xy_listing_monitor_tasks (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
                 owner_id BIGINT DEFAULT NULL COMMENT '归属用户ID，用于多用户数据隔离',
+                category_id BIGINT DEFAULT NULL COMMENT '所属分类ID（NULL=未分类）',
                 monitor_type VARCHAR(20) NOT NULL DEFAULT 'listing' COMMENT '监控类型：listing-上新监控，price_drop-降价监控',
                 keyword VARCHAR(200) NOT NULL COMMENT '商品监控关键字',
                 price_min DECIMAL(12,2) DEFAULT NULL COMMENT '商品价格区间最低值',
@@ -1363,11 +1416,12 @@ class DatabaseInitializer:
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
                 INDEX idx_lmt_owner_enabled (owner_id, is_enabled),
                 INDEX idx_lmt_owner_deleted (owner_id, is_deleted),
-                INDEX idx_lmt_created_at (created_at)
+                INDEX idx_lmt_created_at (created_at),
+                INDEX idx_lmt_category (category_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='商品上新监控任务表';
         """,
 
-        # 45.2 商品监控采集商品信息表
+        # 45.3 商品监控采集商品信息表
         "xy_listing_monitor_items": """
             CREATE TABLE IF NOT EXISTS xy_listing_monitor_items (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
@@ -1398,6 +1452,7 @@ class DatabaseInitializer:
                 dm_attempts INT NOT NULL DEFAULT 0 COMMENT '私信发送尝试次数（失败重试用）',
                 is_ordered TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否已下单成功',
                 order_id VARCHAR(64) DEFAULT NULL COMMENT '下单成功的订单ID（拍下）',
+                order_account_id VARCHAR(80) DEFAULT NULL COMMENT '下单成功使用的账号ID（发起私信时严格使用该账号）',
                 order_status VARCHAR(20) DEFAULT NULL COMMENT '下单结果：success/failed/duplicate',
                 order_fail_reason VARCHAR(500) DEFAULT NULL COMMENT '下单失败原因',
                 order_attempts INT NOT NULL DEFAULT 0 COMMENT '下单尝试次数（失败重试用）',
@@ -1409,7 +1464,12 @@ class DatabaseInitializer:
                 UNIQUE KEY uk_lmi_task_item (monitor_task_id, item_id),
                 INDEX idx_lmi_task (monitor_task_id),
                 INDEX idx_lmi_owner (owner_id),
-                INDEX idx_lmi_publish_time (publish_time)
+                INDEX idx_lmi_publish_time (publish_time),
+                INDEX idx_lmi_created (created_at),
+                INDEX idx_lmi_dm_send (order_status, is_dm_sent, ordered_at),
+                INDEX idx_lmi_order_pending (is_ordered, order_attempts),
+                INDEX idx_lmi_item_ordered (item_id, is_ordered),
+                INDEX idx_lmi_owner_publish (owner_id, publish_time)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='商品监控采集商品信息表';
         """,
 
@@ -1438,16 +1498,32 @@ class DatabaseInitializer:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='商品监控执行日志表';
         """,
 
-        # 45.4 用户级兜底下单账号配置表（任务无可用下单账号时回退使用）
+        # 45.6 用户级兜底下单账号配置表（任务无可用下单账号时回退使用）
         "xy_order_fallback_accounts": """
             CREATE TABLE IF NOT EXISTS xy_order_fallback_accounts (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
-                owner_id BIGINT NOT NULL COMMENT '归属用户ID（唯一，一个用户一条配置）',
+                owner_id BIGINT NOT NULL COMMENT '归属用户ID',
+                category_id BIGINT DEFAULT NULL COMMENT '所属分类ID（NULL=未分类全局兜底）',
                 account_ids JSON DEFAULT NULL COMMENT '兜底下单账号ID列表（JSON数组，多选轮换使用）',
+                is_deleted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否已删除（软删除）',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-                UNIQUE KEY uk_ofa_owner (owner_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户级兜底下单账号配置表';
+                UNIQUE KEY uk_ofa_owner_category (owner_id, category_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户级兜底下单账号配置表（按分类配置）';
+        """,
+
+        # 45.7 用户级兜底采集账号配置表（任务无可用采集账号时回退使用）
+        "xy_collect_fallback_accounts": """
+            CREATE TABLE IF NOT EXISTS xy_collect_fallback_accounts (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
+                owner_id BIGINT NOT NULL COMMENT '归属用户ID',
+                category_id BIGINT DEFAULT NULL COMMENT '所属分类ID（NULL=未分类全局兜底）',
+                account_ids JSON DEFAULT NULL COMMENT '兜底采集账号ID列表（JSON数组，多选轮换使用）',
+                is_deleted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否已删除（软删除）',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                UNIQUE KEY uk_cfa_owner_category (owner_id, category_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户级兜底采集账号配置表（按分类配置）';
         """,
 
         # 46. 共享扫码登录会话表
@@ -1560,6 +1636,7 @@ class DatabaseInitializer:
     COLUMN_MIGRATIONS = {
         "xy_listing_monitor_tasks": [
             ("monitor_type", "VARCHAR(20) NOT NULL DEFAULT 'listing' COMMENT '监控类型：listing-上新监控，price_drop-降价监控'", "owner_id"),
+            ("category_id", "BIGINT DEFAULT NULL COMMENT '所属分类ID（NULL=未分类）'", "owner_id"),
             ("collect_pages", "INT NOT NULL DEFAULT 1 COMMENT '每次采集页数'", "interval_minutes"),
             ("dm_content", "VARCHAR(1000) DEFAULT NULL COMMENT '私信内容（配置下单账号后必填）'", "account_ids"),
             ("order_account_ids", "JSON DEFAULT NULL COMMENT '下单账号ID列表（多选，私信与下单共用）'", "account_ids"),
@@ -1579,6 +1656,7 @@ class DatabaseInitializer:
             ("seller_user_id", "VARCHAR(64) DEFAULT NULL COMMENT '卖家真实用户ID（商品详情接口补全）'", "seller_id"),
             ("detail_json", "MEDIUMTEXT DEFAULT NULL COMMENT '商品详情数据（详情接口返回JSON）'", "raw_json"),
             ("order_id", "VARCHAR(64) DEFAULT NULL COMMENT '下单成功的订单ID（拍下）'", "is_ordered"),
+            ("order_account_id", "VARCHAR(80) DEFAULT NULL COMMENT '下单成功使用的账号ID（发起私信时严格使用该账号）'", "order_id"),
             ("dm_status", "VARCHAR(20) DEFAULT NULL COMMENT '私信发送结果：success/failed/unknown'", "is_dm_sent"),
             ("dm_fail_reason", "VARCHAR(500) DEFAULT NULL COMMENT '私信发送失败原因'", "dm_status"),
             ("dm_attempts", "INT NOT NULL DEFAULT 0 COMMENT '私信发送尝试次数（失败重试用）'", "dm_fail_reason"),
@@ -1593,6 +1671,14 @@ class DatabaseInitializer:
             ("seller_fill_fail_reason", "VARCHAR(500) DEFAULT NULL COMMENT '卖家ID补全失败原因（明确业务失败的原文）'", "seller_fill_status"),
             ("seller_avatar", "VARCHAR(1000) DEFAULT NULL COMMENT '卖家头像URL'", "seller_nick"),
             ("tags", "VARCHAR(500) DEFAULT NULL COMMENT '商品营销标签（逗号分隔，如：4天内上新,235人想要）'", "want_count"),
+        ],
+        "xy_order_fallback_accounts": [
+            ("category_id", "BIGINT DEFAULT NULL COMMENT '所属分类ID（NULL=未分类全局兜底）'", "owner_id"),
+            ("is_deleted", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否已删除（软删除）'", "account_ids"),
+        ],
+        "xy_collect_fallback_accounts": [
+            ("category_id", "BIGINT DEFAULT NULL COMMENT '所属分类ID（NULL=未分类全局兜底）'", "owner_id"),
+            ("is_deleted", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否已删除（软删除）'", "account_ids"),
         ],
         "xy_auto_reply_message_logs": [
             ("send_status", "VARCHAR(20) NOT NULL DEFAULT 'unknown' COMMENT '发送状态：success-发送成功/failed-发送失败/unknown-未知(无响应)/timeout-超时(无响应超过阈值)'", "error_message"),
@@ -1625,6 +1711,9 @@ class DatabaseInitializer:
             ("delivery_only_card_after_close", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '关闭订单后继续发货（只发卡券）'", "auto_close_order"),
             ("delivery_disabled_excluded_items", "JSON DEFAULT NULL COMMENT '禁止发货排除商品列表（item_id 数组，命中后按正常流程发货）'", "delivery_only_card_after_close"),
             ("ai_reply_block_ordered_users", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '已下单用户禁止AI回复'", "delivery_disabled_excluded_items"),
+            ("refund_cancel_enabled", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '退款订单注销开关'", "ai_reply_block_ordered_users"),
+            ("refund_cancel_url", "VARCHAR(255) DEFAULT NULL COMMENT '退款订单注销请求URL'", "refund_cancel_enabled"),
+            ("refund_cancel_timeout", "INT DEFAULT 60 COMMENT '退款订单注销超时时间(秒)'", "refund_cancel_url"),
         ],
         "xy_orders": [
             ("is_bargain", "TINYINT(1) DEFAULT 0 COMMENT '是否小刀'", "account_name"),
@@ -1639,6 +1728,8 @@ class DatabaseInitializer:
             ("delivery_fail_reason", "VARCHAR(2000) COMMENT '发货失败原因'", "delivery_content"),
             ("source", "VARCHAR(32) COMMENT '数据来源：fetch_xianyu-获取闲鱼订单按钮'", "metadata"),
             ("is_red_flower", "TINYINT(1) DEFAULT 0 COMMENT '是否已求小红花'", "is_rated"),
+            ("is_unregistered", "TINYINT(1) DEFAULT 0 COMMENT '是否已请求注销接口'", "is_red_flower"),
+            ("unregister_error_reason", "VARCHAR(500) DEFAULT NULL COMMENT '注销接口错误原因'", "is_unregistered"),
         ],
         "xy_cards": [
             ("delivery_count", "INT DEFAULT 0 COMMENT '发货次数'", "delay_seconds"),
@@ -1666,6 +1757,7 @@ class DatabaseInitializer:
             ("login_locked_until", "DATETIME COMMENT '登录锁定截止时间'", "login_fail_count"),
             ("dock_code", "VARCHAR(32) DEFAULT NULL UNIQUE COMMENT '对接码，用于分销商识别'", "login_locked_until"),
             ("secret_key", "VARCHAR(64) DEFAULT NULL UNIQUE COMMENT '分销秘钥，32位随机字符，全局唯一'", "dock_code"),
+            ("expire_at", "DATETIME DEFAULT NULL COMMENT '账号到期日（精确到秒，NULL=永不过期）'", "secret_key"),
         ],
         "xy_default_replies": [
             ("item_id", "VARCHAR(64) DEFAULT NULL COMMENT '商品ID'", "account_id"),
@@ -2779,6 +2871,25 @@ class DatabaseInitializer:
                 except Exception as e:
                     logger.warning(f"✗ xy_auto_reply_message_logs idx_arml_order_strategy_id 创建失败: {e}")
 
+                # 补建 (reply_strategy, order_no, id) 复合索引 —— 加速订单列表「发送状态」筛选
+                # （子查询 WHERE reply_strategy='auto_delivery' GROUP BY order_no, MAX(id)，无 order_no 限定；
+                #  reply_strategy 最左直接定位、order_no 有序分组、id 覆盖，避免百万级日志表全索引扫描）
+                try:
+                    check = text("""
+                        SELECT COUNT(*) FROM information_schema.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                        AND TABLE_NAME = 'xy_auto_reply_message_logs'
+                        AND INDEX_NAME = 'idx_arml_strategy_order_id'
+                    """)
+                    result = await conn.execute(check)
+                    if result.scalar() == 0:
+                        await conn.execute(text(
+                            "ALTER TABLE xy_auto_reply_message_logs ADD INDEX idx_arml_strategy_order_id (reply_strategy, order_no, id)"
+                        ))
+                        logger.info("✓ xy_auto_reply_message_logs: 创建 idx_arml_strategy_order_id 复合索引")
+                except Exception as e:
+                    logger.warning(f"✗ xy_auto_reply_message_logs idx_arml_strategy_order_id 创建失败: {e}")
+
             # 为 xy_dock_records 补建 (source_user_id, level) 复合索引 —— 加速二级分销商列表查询
             try:
                 check = text("""
@@ -2847,6 +2958,69 @@ class DatabaseInitializer:
             except Exception as e:
                 logger.warning(f"✗ xy_platform_blacklist idx_plb_created 创建失败: {e}")
 
+            # 为 xy_listing_monitor_items 补建 created_at 索引 —— 加速「卖家ID补全」等定时任务按当天采集入库时间过滤
+            try:
+                check = text("""
+                    SELECT COUNT(*) FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'xy_listing_monitor_items'
+                    AND INDEX_NAME = 'idx_lmi_created'
+                """)
+                result = await conn.execute(check)
+                if result.scalar() == 0:
+                    await conn.execute(text(
+                        "ALTER TABLE xy_listing_monitor_items ADD INDEX idx_lmi_created (created_at)"
+                    ))
+                    logger.info("✓ xy_listing_monitor_items: 创建 idx_lmi_created 索引")
+            except Exception as e:
+                logger.warning(f"✗ xy_listing_monitor_items idx_lmi_created 创建失败: {e}")
+
+            # 为 xy_listing_monitor_items 补建查询索引 —— 原仅有 task/owner/publish_time/created_at 索引，
+            # 未覆盖调度任务/去重/列表的高频过滤字段，表数据增大后会全表扫描导致查询很慢
+            lmi_query_indexes = [
+                # 「采集商品发送私信」定时任务：order_status='success' + is_dm_sent=0 + ordered_at>=cutoff
+                ("idx_lmi_dm_send", "(order_status, is_dm_sent, ordered_at)"),
+                # 「采集商品自动下单」定时任务：is_ordered=0 + order_attempts<上限
+                ("idx_lmi_order_pending", "(is_ordered, order_attempts)"),
+                # 下单去重 has_owner_ordered_item：item_id + is_ordered（item_id 原仅为联合唯一键非最左列）
+                ("idx_lmi_item_ordered", "(item_id, is_ordered)"),
+                # 前端列表分页：owner_id 过滤 + 按 publish_time 排序
+                ("idx_lmi_owner_publish", "(owner_id, publish_time)"),
+            ]
+            for idx_name, idx_cols in lmi_query_indexes:
+                try:
+                    check = text("""
+                        SELECT COUNT(*) FROM information_schema.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                        AND TABLE_NAME = 'xy_listing_monitor_items'
+                        AND INDEX_NAME = :idx_name
+                    """)
+                    result = await conn.execute(check, {"idx_name": idx_name})
+                    if result.scalar() == 0:
+                        await conn.execute(text(
+                            f"ALTER TABLE xy_listing_monitor_items ADD INDEX {idx_name} {idx_cols}"
+                        ))
+                        logger.info(f"✓ xy_listing_monitor_items: 创建 {idx_name} 索引")
+                except Exception as e:
+                    logger.warning(f"✗ xy_listing_monitor_items {idx_name} 创建失败: {e}")
+
+            # 为 xy_listing_monitor_tasks 补建 category_id 索引 —— 加速按分类筛选任务
+            try:
+                check = text("""
+                    SELECT COUNT(*) FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'xy_listing_monitor_tasks'
+                    AND INDEX_NAME = 'idx_lmt_category'
+                """)
+                result = await conn.execute(check)
+                if result.scalar() == 0:
+                    await conn.execute(text(
+                        "ALTER TABLE xy_listing_monitor_tasks ADD INDEX idx_lmt_category (category_id)"
+                    ))
+                    logger.info("✓ xy_listing_monitor_tasks: 创建 idx_lmt_category 索引")
+            except Exception as e:
+                logger.warning(f"✗ xy_listing_monitor_tasks idx_lmt_category 创建失败: {e}")
+
             # 为 xy_risk_control_logs 补建 (owner_id, created_at) 复合索引 —— 加速按用户筛选+时间倒序分页
             try:
                 check = text("""
@@ -2863,6 +3037,73 @@ class DatabaseInitializer:
                     logger.info("✓ xy_risk_control_logs: 创建 idx_rcl_owner_created 复合索引")
             except Exception as e:
                 logger.warning(f"✗ xy_risk_control_logs idx_rcl_owner_created 创建失败: {e}")
+
+            # 迁移兜底账号表唯一键：从 (owner_id) 改为 (owner_id, category_id)
+            # xy_order_fallback_accounts
+            try:
+                check_old = text("""
+                    SELECT COUNT(*) FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'xy_order_fallback_accounts'
+                    AND INDEX_NAME = 'uk_ofa_owner'
+                """)
+                result = await conn.execute(check_old)
+                if result.scalar() > 0:
+                    # 删除旧唯一键
+                    await conn.execute(text(
+                        "ALTER TABLE xy_order_fallback_accounts DROP INDEX uk_ofa_owner"
+                    ))
+                    logger.info("✓ xy_order_fallback_accounts: 删除旧唯一键 uk_ofa_owner")
+
+                # 检查新唯一键是否存在
+                check_new = text("""
+                    SELECT COUNT(*) FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'xy_order_fallback_accounts'
+                    AND INDEX_NAME = 'uk_ofa_owner_category'
+                """)
+                result = await conn.execute(check_new)
+                if result.scalar() == 0:
+                    # 添加新唯一键
+                    await conn.execute(text(
+                        "ALTER TABLE xy_order_fallback_accounts ADD UNIQUE KEY uk_ofa_owner_category (owner_id, category_id)"
+                    ))
+                    logger.info("✓ xy_order_fallback_accounts: 创建新唯一键 uk_ofa_owner_category")
+            except Exception as e:
+                logger.warning(f"✗ xy_order_fallback_accounts 唯一键迁移失败: {e}")
+
+            # xy_collect_fallback_accounts
+            try:
+                check_old = text("""
+                    SELECT COUNT(*) FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'xy_collect_fallback_accounts'
+                    AND INDEX_NAME = 'uk_cfa_owner'
+                """)
+                result = await conn.execute(check_old)
+                if result.scalar() > 0:
+                    # 删除旧唯一键
+                    await conn.execute(text(
+                        "ALTER TABLE xy_collect_fallback_accounts DROP INDEX uk_cfa_owner"
+                    ))
+                    logger.info("✓ xy_collect_fallback_accounts: 删除旧唯一键 uk_cfa_owner")
+
+                # 检查新唯一键是否存在
+                check_new = text("""
+                    SELECT COUNT(*) FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'xy_collect_fallback_accounts'
+                    AND INDEX_NAME = 'uk_cfa_owner_category'
+                """)
+                result = await conn.execute(check_new)
+                if result.scalar() == 0:
+                    # 添加新唯一键
+                    await conn.execute(text(
+                        "ALTER TABLE xy_collect_fallback_accounts ADD UNIQUE KEY uk_cfa_owner_category (owner_id, category_id)"
+                    ))
+                    logger.info("✓ xy_collect_fallback_accounts: 创建新唯一键 uk_cfa_owner_category")
+            except Exception as e:
+                logger.warning(f"✗ xy_collect_fallback_accounts 唯一键迁移失败: {e}")
 
             # 为 xy_orders 补建 (account_id, order_no) 唯一约束 —— 防止「定时获取闲鱼订单」
             # 与「获取待发货订单」两个任务并发 upsert 时重复插入同一订单（B方案兜底）。

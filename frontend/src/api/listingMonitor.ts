@@ -5,7 +5,7 @@
  * 1. 查询上新监控任务分页列表
  * 2. 新建、编辑、启停、批量删除监控任务
  */
-import { get, post, put } from '@/utils/request'
+import { del, get, post, put } from '@/utils/request'
 import type { ApiResponse } from '@/types'
 
 const PREFIX = '/api/v1/product-monitor/listing-tasks'
@@ -28,6 +28,7 @@ export const MONITOR_TYPE_LABELS: Record<string, string> = MONITOR_TYPE_OPTIONS.
 
 export interface ListingMonitorTask {
   id: number
+  category_id?: number | null
   monitor_type: MonitorType
   keyword: string
   price_min?: number | null
@@ -66,6 +67,7 @@ export interface ListingMonitorOverview {
   today_collected: number
   today_new: number
   today_dm: number
+  today_dm_failed: number
   today_ordered: number
   today_order_failed: number
   today_order_duplicate: number
@@ -84,6 +86,7 @@ export interface ListingMonitorTaskListData {
 
 export interface ListingMonitorTaskSaveParams {
   monitor_type: MonitorType
+  category_id: number
   keyword: string
   price_min?: number | null
   price_max?: number | null
@@ -112,6 +115,7 @@ export const getListingMonitorTasks = (
   params?: {
     keyword?: string
     isEnabled?: boolean
+    categoryId?: number
   }
 ): Promise<ApiResponse<ListingMonitorTaskListData>> => {
   const searchParams = new URLSearchParams({
@@ -120,6 +124,7 @@ export const getListingMonitorTasks = (
   })
   if (params?.keyword) searchParams.append('keyword', params.keyword)
   if (params?.isEnabled !== undefined) searchParams.append('is_enabled', String(params.isEnabled))
+  if (params?.categoryId !== undefined) searchParams.append('category_id', String(params.categoryId))
   return get(`${PREFIX}?${searchParams.toString()}`)
 }
 
@@ -154,13 +159,29 @@ export const batchDeleteListingMonitorTasks = (
   return post(`${PREFIX}/batch-delete`, { ids: taskIds })
 }
 
-// 批量修改监控任务的账号（监控账号 account_ids 或下单账号 order_account_ids）
+// 批量修改监控任务的账号（采集账号 account_ids 或下单账号 order_account_ids）
 export const batchUpdateListingMonitorAccounts = (
   taskIds: number[],
   field: 'account_ids' | 'order_account_ids',
   accountIds: string[]
 ): Promise<ApiResponse<ListingMonitorBatchDeleteResult>> => {
   return post(`${PREFIX}/batch-update-accounts`, { ids: taskIds, field, account_ids: accountIds })
+}
+
+// 批量修改监控任务的所属分类
+export const batchUpdateListingMonitorCategory = (
+  taskIds: number[],
+  categoryId: number
+): Promise<ApiResponse<ListingMonitorBatchDeleteResult>> => {
+  return post(`${PREFIX}/batch-update-category`, { ids: taskIds, category_id: categoryId })
+}
+
+// 批量修改监控任务的私信内容
+export const batchUpdateListingMonitorDmContent = (
+  taskIds: number[],
+  dmContent: string
+): Promise<ApiResponse<ListingMonitorBatchDeleteResult>> => {
+  return post(`${PREFIX}/batch-update-dm-content`, { ids: taskIds, dm_content: dmContent })
 }
 
 // 监控日志账号Cookie复制项
@@ -235,6 +256,11 @@ export const getListingMonitorLogs = (
   return get(`${PREFIX}/logs?${searchParams.toString()}`)
 }
 
+// 清空监控日志（只清空10天前的数据，保留最近10天）
+export const clearListingMonitorLogs = (): Promise<ApiResponse<{ deleted_count: number }>> => {
+  return del(`${PREFIX}/logs/clear`)
+}
+
 // ==================== 采集商品 ====================
 
 export interface ListingMonitorItem {
@@ -265,9 +291,11 @@ export interface ListingMonitorItem {
   dm_attempts?: number
   is_ordered: boolean
   order_id?: string | null
+  order_account_id?: string | null
   order_status?: string | null
   order_fail_reason?: string | null
   order_attempts?: number
+  ordered_at?: string | null
   last_seen_at?: string | null
   created_at?: string | null
   updated_at?: string | null
@@ -315,6 +343,13 @@ export const getListingMonitorItems = (
   if (params?.createdStart) searchParams.append('created_start', params.createdStart)
   if (params?.createdEnd) searchParams.append('created_end', params.createdEnd)
   return get(`${PREFIX}/items?${searchParams.toString()}`)
+}
+
+// 批量将选中的"私信失败"采集商品重置为"未私信"，等待定时任务重试
+export const resetListingMonitorItemsDm = (
+  itemIds: number[]
+): Promise<ApiResponse<ListingMonitorBatchDeleteResult>> => {
+  return post(`${PREFIX}/items/reset-dm`, { ids: itemIds })
 }
 
 // 采集商品完整详情（含数据库存储的原始详情/搜索数据）

@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from common.db.session import async_session_maker
 from common.models.listing_monitor_item import ListingMonitorItem
@@ -26,6 +26,8 @@ from common.models.listing_monitor_task import ListingMonitorTask
 from common.models.xy_account import XYAccount
 from common.services.account_cooldown import DEFAULT_COOLDOWN_SECONDS, account_cooldown_manager
 from common.services.listing_monitor_dedup import has_owner_ordered_item
+from common.services.collect_account_loader import merge_task_and_fallback_account_ids
+from common.services.order_account_loader import load_fallback_accounts
 from common.services.xianyu_mtop import fetch_proxy_from_api
 from common.services.xianyu_order_client import XianyuOrderClient
 from common.services.xianyu_search_client import XianyuSearchClient, parse_search_item
@@ -48,6 +50,7 @@ _ITEM_FIELD_LIMITS = {
     "area": 120,
     "pic_url": 1000,
     "seller_id": 120,
+    "seller_user_id": 64,
     "seller_nick": 120,
     "seller_avatar": 1000,
     "want_count": 32,
@@ -85,6 +88,9 @@ def _ms_to_beijing_naive(publish_time_ms: Optional[str]) -> Optional[datetime]:
 class ListingMonitorTaskService:
     """商品监控定时任务服务"""
 
+    # 监控日志保留天数，超过该天数的日志在每次任务执行时主动清理
+    LOG_RETENTION_DAYS = 10
+
     def __init__(self, task_name: str = "商品监控任务"):
         self.task_name = task_name
         self._lock = asyncio.Lock()
@@ -108,6 +114,9 @@ class ListingMonitorTaskService:
     async def _execute_inner(self, force: bool, trigger_type: str):
         logger.info(f"【{self.task_name}】开始执行（force={force}，trigger_type={trigger_type}）")
         start_time = datetime.now()
+
+        # 主动清理过期的监控日志（10天前）
+        await self._cleanup_expired_logs()
 
         try:
             tasks = await self._get_enabled_tasks()
@@ -187,6 +196,30 @@ class ListingMonitorTaskService:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    async def _cleanup_expired_logs(self) -> None:
+        """主动清理过期的监控日志。
+
+        删除 created_at 早于 (当前北京时间 - LOG_RETENTION_DAYS 天) 的日志记录，
+        避免日志表无限增长。使用参数化的 ORM delete 语句，避免 SQL 注入。
+        """
+        try:
+            cutoff_time = get_beijing_now_naive() - timedelta(days=self.LOG_RETENTION_DAYS)
+            async with async_session_maker() as session:
+                stmt = delete(ListingMonitorLog).where(
+                    ListingMonitorLog.created_at < cutoff_time
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                deleted_count = result.rowcount or 0
+
+            if deleted_count > 0:
+                logger.info(
+                    f"【{self.task_name}】已清理 {deleted_count} 条 {self.LOG_RETENTION_DAYS} 天前的监控日志"
+                    f"（清理时间界限: {cutoff_time}）"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"【{self.task_name}】清理过期日志失败: {e}")
+
     async def _load_accounts(self, account_ids: List[str]) -> List[XYAccount]:
         """按监控任务配置的账号ID列表加载可用账号（保持配置顺序、过滤禁用）。"""
         if not account_ids:
@@ -197,6 +230,29 @@ class ListingMonitorTaskService:
         by_id = {row.account_id: row for row in rows}
         ordered: List[XYAccount] = []
         for account_id in account_ids:
+            acc = by_id.get(account_id)
+            if not acc or not acc.cookie:
+                continue
+            if (acc.status or "active").strip().lower() in _INACTIVE_STATUSES:
+                continue
+            ordered.append(acc)
+        return ordered
+
+    async def _resolve_and_load_accounts(self, task: ListingMonitorTask) -> List[XYAccount]:
+        """合并任务采集账号与兜底账号，加载可用账号（单次 session，减少连接获取）。"""
+        async with async_session_maker() as session:
+            # 合并任务账号 + 兜底（本用户·本分类→本用户·无分类→管理员·本分类→管理员·无分类）
+            merged_ids = await merge_task_and_fallback_account_ids(
+                session, list(task.account_ids or []), task.owner_id, task.category_id
+            )
+            if not merged_ids:
+                return []
+            # 同一 session 内加载账号（过滤失效）
+            stmt = select(XYAccount).where(XYAccount.account_id.in_(merged_ids))
+            rows = list((await session.execute(stmt)).scalars().all())
+        by_id = {row.account_id: row for row in rows}
+        ordered: List[XYAccount] = []
+        for account_id in merged_ids:
             acc = by_id.get(account_id)
             if not acc or not acc.cookie:
                 continue
@@ -239,7 +295,7 @@ class ListingMonitorTaskService:
     async def _process_task(self, task: ListingMonitorTask, trigger_type: str = "auto"):
         """处理单个监控任务：采集 + 入库 + 写日志 + 更新执行时间。"""
         sort_field, sort_value = _MONITOR_SORT_MAP.get(task.monitor_type, _MONITOR_SORT_MAP["listing"])
-        accounts = await self._load_accounts(list(task.account_ids or []))
+        accounts = await self._resolve_and_load_accounts(task)
 
         # 负载均衡：跨任务（同用户）查最新40条监控日志，统计用过的账号；
         # 优先使用未在最近日志中出现的账号（跳过最近用过的），
@@ -281,7 +337,7 @@ class ListingMonitorTaskService:
             if cooldown_blocked:
                 message = "所有关联账号都在风控冷却期，本次跳过采集"
             else:
-                message = "无可用账号（账号不存在/禁用/Cookie为空）"
+                message = "无可用采集账号（任务账号与兜底账号均不可用：不存在/禁用/Cookie为空）"
             logger.warning(f"【{self.task_name}】监控任务 {task.id}({task.keyword}) {message}")
         else:
             price_min = float(task.price_min) if task.price_min is not None else None
@@ -400,6 +456,11 @@ class ListingMonitorTaskService:
             order_accounts = await self._load_accounts(list(task.order_account_ids or []))
         order_disabled: set[str] = set()
         order_rr = [0]
+        # 兜底下单账号（任务账号失效或未配置时使用）：监控任务所有商品共用，懒加载且仅一次
+        fallback_accounts: List[XYAccount] = []
+        fallback_detail: str = ""
+        fallback_rr = [0]
+        fallback_loaded = False
 
         async with async_session_maker() as session:
             item_ids = list(dedup.keys())
@@ -421,6 +482,9 @@ class ListingMonitorTaskService:
                     row.area = fields["area"]
                     row.pic_url = fields["pic_url"]
                     row.seller_id = fields["seller_id"]
+                    # 卖家真实ID仅在当前为空时补全，避免覆盖 seller_fill 已通过详情接口补全的值
+                    if not row.seller_user_id and fields["seller_user_id"]:
+                        row.seller_user_id = fields["seller_user_id"]
                     row.seller_nick = fields["seller_nick"]
                     row.seller_avatar = fields["seller_avatar"]
                     row.want_count = fields["want_count"]
@@ -441,6 +505,8 @@ class ListingMonitorTaskService:
                         area=fields["area"],
                         pic_url=fields["pic_url"],
                         seller_id=fields["seller_id"],
+                        # 采集时直接从主图 picUrl 提取卖家真实ID（取不到则 None，由 seller_fill 兜底补全）
+                        seller_user_id=fields["seller_user_id"],
                         seller_nick=fields["seller_nick"],
                         seller_avatar=fields["seller_avatar"],
                         want_count=fields["want_count"],
@@ -450,22 +516,41 @@ class ListingMonitorTaskService:
                         raw_json=raw_json,
                         last_seen_at=now,
                     )
-                    # 开启直接下单且配置了下单账号：先下单再入库（入库即终态，避免与定时下单并发）
-                    if direct_order and order_accounts:
+                    # 开启直接下单：先下单再入库（入库即终态，避免与定时下单并发）
+                    # 触发条件已放宽——仅需 direct_order=True，任务即使未配下单账号也可使用兜底账号
+                    if direct_order:
                         # 去重：同一用户该商品已被其他监控任务下单成功，则跳过重复下单
                         if await has_owner_ordered_item(session, task.owner_id, item_id):
-                            new_item.is_dm_sent = True
+                            # 重复商品并未实际发送私信，不再置 is_dm_sent=True（避免误显示「已发待确认」）；
+                            # 其 order_status="duplicate" 已被发私信任务的 order_status=="success" 网关排除，不会被发私信
                             new_item.is_ordered = True
                             new_item.order_status = "duplicate"
                             new_item.order_fail_reason = "同商品已在其他监控任务下单，跳过重复下单"
                             logger.info(f"【{self.task_name}】商品 {item_id} 已被同用户其他任务下单，跳过直接下单")
                         else:
+                            # 兜底账号懒加载：监控任务的所有商品共用，仅一次 IO
+                            if not fallback_loaded:
+                                fallback_accounts_map, fallback_detail = await load_fallback_accounts(
+                                    task.owner_id, task.category_id, log_prefix=self.task_name
+                                )
+                                fallback_accounts = list(fallback_accounts_map.values())
+                                fallback_loaded = True
                             try:
-                                await self._direct_order_item(new_item, item_id, order_accounts, order_disabled, order_rr)
+                                await self._direct_order_item(
+                                    new_item,
+                                    item_id,
+                                    order_accounts,
+                                    fallback_accounts,
+                                    fallback_detail,
+                                    order_disabled,
+                                    order_rr,
+                                    fallback_rr,
+                                )
                             except Exception as exc:  # noqa: BLE001
                                 # 下单过程异常也要把商品入库并保存失败原因，避免漏采集
+                                # （不再置 is_dm_sent=True：失败不发私信由查询的 order_status=success 网关保证，
+                                #   且后续被定时下单任务补单成功后仍可正常发起私信）
                                 logger.error(f"【{self.task_name}】商品 {item_id} 采集后直接下单异常: {exc}")
-                                new_item.is_dm_sent = True
                                 new_item.order_status = "failed"
                                 new_item.order_fail_reason = str(exc)[:500]
                                 new_item.order_attempts = 1
@@ -479,31 +564,74 @@ class ListingMonitorTaskService:
         self,
         item: ListingMonitorItem,
         item_id: str,
-        accounts: List[XYAccount],
+        task_accounts: List[XYAccount],
+        fallback_accounts: List[XYAccount],
+        fallback_detail: str,
         disabled: set,
         rr: List[int],
+        fallback_rr: List[int],
     ) -> None:
-        """采集后直接下单：用下单账号轮换对该商品下单，结果写入 item（随后随采集一起入库）。
+        """采集后直接下单：任务账号 + 兜底账号合并候选轮换下单，结果写入 item（随后随采集一起入库）。
 
-        直接下单跳过私信环节（置 is_dm_sent=true）。策略：只要接口未返回成功就换下一个候选账号继续尝试：
-        - 下单成功：is_ordered=true，记录 order_id；
+        下单成功后由"采集商品发送私信"任务在下单成功之后再发起私信（不再预先置 is_dm_sent 跳过私信）。
+        落库语义与定时下单任务（auto_order_task）对齐：
+        - 候选为空（任务账号与兜底账号本次全部失效，或两者均未配置）：
+            order_status="no_account"，order_attempts 不累加，is_ordered=false；
+            交由定时下单任务后续重试。
+        - 下单成功：is_ordered=true，order_attempts=1，记录 order_id；
         - 账号不可用（Session/Token过期、需登录、风控）：本次停用该账号并换号；
-        - 业务失败（商品不可买/缺地址/权限受限等）：换下一个候选账号继续尝试，但不全局停用该账号
-          （可能仅该商品不可买，账号对其它商品仍可用）；
-        - 全部候选账号都试过仍失败：order_status=failed、order_attempts=1，后续由定时下单任务重试；
-        - 全部账号均不可用：不下单（is_ordered=false、order_attempts=0），交由定时下单任务后续重试。
+        - 业务失败（商品不可买/缺地址/权限受限等）：换下一个候选账号继续尝试；
+        - 全部候选都试过：有业务失败则 order_status="failed"、order_attempts=1；
+            否则视为全部账号在下单时被判失效，order_status="no_account"、order_attempts 不累加。
         """
-        item.is_dm_sent = True  # 直接下单跳过私信
-        n = len(accounts)
-        start = rr[0]  # 固定本次起点，避免循环内修改导致索引跳跃
+
+        # 1) 合并候选：任务账号在前、兜底在后，按 account_id 去重；
+        #    任务账号按 rr 起点旋转，兜底独立 fallback_rr 轮换，避免总从同一个账号开始
+        if task_accounts:
+            n_task = len(task_accounts)
+            start_task = rr[0]
+            rotated_task = [task_accounts[(start_task + i) % n_task] for i in range(n_task)]
+            usable_task = [a for a in rotated_task if a.account_id not in disabled]
+        else:
+            usable_task = []
+
+        if fallback_accounts:
+            n_fb = len(fallback_accounts)
+            start_fb = fallback_rr[0]
+            fallback_rr[0] = start_fb + 1
+            rotated_fb = [fallback_accounts[(start_fb + i) % n_fb] for i in range(n_fb)]
+            usable_fb = [a for a in rotated_fb if a.account_id not in disabled]
+        else:
+            usable_fb = []
+
+        seen: set[str] = set()
+        candidates: List[XYAccount] = []
+        used_task_ids: set[str] = {a.account_id for a in usable_task}
+        for acc in usable_task + usable_fb:
+            if acc.account_id in seen:
+                continue
+            seen.add(acc.account_id)
+            candidates.append(acc)
+
+        # 2) 候选为空：账号问题不累加 attempts，留待定时下单任务后续重试
+        if not candidates:
+            task_reason = "未配置下单账号" if not task_accounts else "配置账号本次运行均失效（Token过期/需登录/风控）"
+            fb_reason = fallback_detail or "未配置兜底下单账号"
+            item.order_status = "no_account"
+            item.order_fail_reason = (
+                f"无可用下单账号：任务账号不可用（{task_reason}）；兜底下单账号也不可用（{fb_reason}）"
+            )[:500]
+            logger.warning(
+                f"【{self.task_name}】商品 {item_id} 采集后直接下单无可用账号（含兜底），"
+                f"原因：{item.order_fail_reason}，留待定时下单任务重试"
+            )
+            return
+
+        # 3) 逐个候选尝试下单
         had_business_failure = False
         last_fail_reason: Optional[str] = None
         last_acc_id: Optional[str] = None
-        last_offset = 0
-        for offset in range(n):
-            acc = accounts[(start + offset) % n]
-            if acc.account_id in disabled:
-                continue
+        for acc in candidates:
             client = XianyuOrderClient(acc.account_id, acc.cookie, owner_id=acc.owner_id)
             result = await client.place_order(item_id)
             acc.cookie = client.cookies_str  # 令牌刷新回写
@@ -515,43 +643,57 @@ class ListingMonitorTaskService:
                 )
                 continue
             if status == "success":
-                # 确定使用该账号：推进轮换指针到下一个账号
-                rr[0] = start + offset + 1
-                item.dm_account_id = acc.account_id
+                # 仅当使用的是任务账号时推进任务 rr 指针；兜底账号有独立 fallback_rr
+                if acc.account_id in used_task_ids:
+                    rr[0] = rr[0] + 1
+                # 仅记录下单账号到 order_account_id；dm_account_id 留待"私信成功后"再写入，
+                # 避免下单完成但尚未私信时前端「私信账号」列提前显示值、与「已私信=否」不一致
+                item.order_account_id = acc.account_id[:80]
                 item.order_attempts = 1
                 item.is_ordered = True
                 item.order_status = "success"
                 item.ordered_at = get_beijing_now_naive()
                 order_id = result.get("order_id")
                 item.order_id = str(order_id)[:64] if order_id else None
-                logger.info(f"【{self.task_name}】商品 {item_id} 采集后直接下单成功（拍下）：账号={acc.account_id}，订单ID={item.order_id}")
+                logger.info(
+                    f"【{self.task_name}】商品 {item_id} 采集后直接下单成功（拍下）："
+                    f"账号={acc.account_id}，订单ID={item.order_id}"
+                )
                 return
             # 业务失败：换下一个候选账号继续尝试（不全局停用，可能仅该商品不可买）
             had_business_failure = True
             last_fail_reason = result.get("error")
             last_acc_id = acc.account_id
-            last_offset = offset
             logger.warning(
                 f"【{self.task_name}】商品 {item_id} 采集后直接下单失败（账号 {acc.account_id}）：{result.get('error')}，尝试下一个账号"
             )
             continue
 
-        # 所有候选账号都尝试过仍未成功
+        # 4) 所有候选账号都尝试过仍未成功
         if had_business_failure:
-            # 推进轮换指针，避免下个商品仍从同一账号开始
-            rr[0] = start + last_offset + 1
-            item.dm_account_id = last_acc_id
+            # 推进任务账号轮换指针（仅当最后失败的是任务账号），避免下个商品仍从同一账号开始
+            if last_acc_id in used_task_ids:
+                rr[0] = rr[0] + 1
+            # 不写 dm_account_id：下单失败既无成功私信，也无成功下单账号；
+            # dm_account_id 仅代表"私信成功账号"，避免前端「私信账号」列显示已失败账号、与「已私信=否」不一致
             item.order_attempts = 1
             item.order_status = "failed"
             item.order_fail_reason = str(last_fail_reason)[:500] if last_fail_reason else None
             logger.warning(
-                f"【{self.task_name}】商品 {item_id} 采集后直接下单：所有下单账号均失败，"
+                f"【{self.task_name}】商品 {item_id} 采集后直接下单：所有候选账号均失败，"
                 f"最后失败原因（账号 {last_acc_id}）：{last_fail_reason}，留待定时下单任务重试"
             )
             return
-        # 所有下单账号本次都不可用：推进一格避免下个商品仍从同一坏账号开始，交由定时下单任务后续重试
-        rr[0] = start + 1
-        logger.warning(f"【{self.task_name}】商品 {item_id} 采集后直接下单无可用账号，留待定时下单任务重试")
+
+        # 全部候选都被判 account_invalid：账号问题不累加 attempts，留待定时下单任务后续重试
+        item.order_status = "no_account"
+        item.order_fail_reason = (
+            "无可用下单账号：任务账号与兜底账号在下单时全部失效（Session/Token过期、需重新登录或被风控）"
+        )
+        logger.warning(
+            f"【{self.task_name}】商品 {item_id} 采集后直接下单：所有候选账号（含兜底）在下单时全部失效，"
+            f"留待定时下单任务重试"
+        )
 
     @staticmethod
     def _dump_raw(raw_main) -> Optional[str]:

@@ -9,16 +9,18 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Sequence
 
-from sqlalchemy import case, desc, func, or_, select
+from loguru import logger
+from sqlalchemy import case, delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.listing_monitor_task import ListingMonitorTask
 from common.models.listing_monitor_item import ListingMonitorItem
 from common.models.listing_monitor_log import ListingMonitorLog
+from common.models.listing_monitor_category import ListingMonitorCategory
 from common.models.xy_account import XYAccount
 from common.models.user import User
 from common.utils.time_utils import get_beijing_now_naive, safe_isoformat
@@ -28,6 +30,9 @@ _VALID_PAGE_SIZES = (10, 20, 50, 100)
 
 # 合法监控类型：listing-上新监控，price_drop-降价监控
 _VALID_MONITOR_TYPES = ("listing", "price_drop")
+
+# 监控日志保留天数：清空日志与定时自动清理均只删除该天数之前的数据
+LOG_RETENTION_DAYS = 10
 
 
 def _to_decimal(value: Any) -> Optional[Decimal]:
@@ -75,6 +80,7 @@ def _task_to_dict(task: ListingMonitorTask) -> Dict[str, Any]:
     return {
         "id": task.id,
         "owner_id": task.owner_id,
+        "category_id": task.category_id,
         "monitor_type": task.monitor_type,
         "keyword": task.keyword,
         "price_min": float(task.price_min) if task.price_min is not None else None,
@@ -150,9 +156,11 @@ def _item_to_dict(item: ListingMonitorItem, task_keyword: Optional[str] = None) 
         "dm_attempts": item.dm_attempts,
         "is_ordered": bool(item.is_ordered),
         "order_id": item.order_id,
+        "order_account_id": item.order_account_id,
         "order_status": item.order_status,
         "order_fail_reason": item.order_fail_reason,
         "order_attempts": item.order_attempts,
+        "ordered_at": safe_isoformat(item.ordered_at),
         "last_seen_at": safe_isoformat(item.last_seen_at),
         "created_at": safe_isoformat(item.created_at),
         "updated_at": safe_isoformat(item.updated_at),
@@ -164,6 +172,32 @@ class ListingMonitorService:
 
     def __init__(self, session: AsyncSession):
         self.session = session
+
+    async def _resolve_category(
+        self, owner_id: Optional[int], category_id: int
+    ) -> ListingMonitorCategory:
+        """校验分类存在且当前用户有权使用。
+
+        普通用户只能使用自己创建的分类；管理员（owner_id=None）可使用任意分类。
+        与分类列表的隔离规则保持一致，防止普通用户通过构造请求挂用他人分类。
+
+        Args:
+            owner_id: 数据隔离范围。None=管理员（不限制归属）；非 None 仅限本人创建的分类
+            category_id: 分类ID
+
+        Returns:
+            校验通过的分类对象
+
+        Raises:
+            ValueError: 分类不存在、已删除或无权限使用
+        """
+        category = await self.session.get(ListingMonitorCategory, category_id)
+        if not category or category.is_deleted:
+            raise ValueError("所选分类不存在")
+        # 普通用户只能使用自己创建的分类；管理员不受限
+        if owner_id is not None and category.owner_id != owner_id:
+            raise ValueError("所选分类不存在或无权限使用")
+        return category
 
     async def _normalize_payload(self, owner_id: Optional[int], data: dict, partial: bool) -> Dict[str, Any]:
         """校验并规整请求数据。partial=True 时仅处理传入的字段（用于更新）。"""
@@ -177,6 +211,19 @@ class ListingMonitorService:
             if monitor_type not in _VALID_MONITOR_TYPES:
                 raise ValueError("监控类型不正确")
             payload["monitor_type"] = monitor_type
+
+        # 所属分类（必填）
+        if "category_id" in data or not partial:
+            raw_category = data.get("category_id")
+            if raw_category is None or raw_category == "":
+                raise ValueError("请选择分类")
+            try:
+                category_id = int(raw_category)
+            except (TypeError, ValueError):
+                raise ValueError("分类参数不正确")
+            # 校验分类存在且当前用户有权使用（普通用户仅限本人分类）
+            await self._resolve_category(owner_id, category_id)
+            payload["category_id"] = category_id
 
         # 关键字（必填）
         if "keyword" in data or not partial:
@@ -253,11 +300,9 @@ class ListingMonitorService:
                     raise ValueError("代理API地址格式不正确，需以 http:// 或 https:// 开头")
             payload["proxy_url"] = proxy_url or None
 
-        # 账号列表（多选，必填：至少关联一个账号）
+        # 采集账号列表（多选，非必填；不可用时回退用户级/管理员兜底采集账号）
         if "account_ids" in data or not partial:
             account_ids = await self._normalize_account_ids(owner_id, data.get("account_ids"))
-            if not account_ids:
-                raise ValueError("请至少选择一个关联账号")
             payload["account_ids"] = account_ids
 
         # 下单账号列表（多选，非必填；私信与下单共用，轮换使用）
@@ -464,10 +509,21 @@ class ListingMonitorService:
                 select(distinct_item).where(*_item_cond([ListingMonitorItem.created_at >= today_start]))
             )
         ).scalar() or 0
-        # 今日私信数（去重）：今日实际发起私信
+        # 今日私信成功数（去重）：今日实际发起私信（dm_sent_at 在成功/超时未确认时写入）
         today_dm = (
             await self.session.execute(
                 select(distinct_item).where(*_item_cond([ListingMonitorItem.dm_sent_at >= today_start]))
+            )
+        ).scalar() or 0
+        # 今日私信失败数（去重）：今日入库（created_at 在今日）且私信结果为失败（被拦截/账号不存在）
+        today_dm_failed = (
+            await self.session.execute(
+                select(distinct_item).where(
+                    *_item_cond([
+                        ListingMonitorItem.created_at >= today_start,
+                        ListingMonitorItem.dm_status == "failed",
+                    ])
+                )
             )
         ).scalar() or 0
         # 今日下单数（去重）：今日下单成功
@@ -522,6 +578,7 @@ class ListingMonitorService:
             "today_collected": int(today_collected),
             "today_new": int(today_new),
             "today_dm": int(today_dm),
+            "today_dm_failed": int(today_dm_failed),
             "today_ordered": int(today_ordered),
             "today_order_failed": int(today_order_failed),
             "today_order_duplicate": int(today_order_duplicate),
@@ -537,6 +594,7 @@ class ListingMonitorService:
         page_size: int = 20,
         keyword: Optional[str] = None,
         is_enabled: Optional[bool] = None,
+        category_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """分页查询上新监控任务列表。"""
         page = max(page, 1)
@@ -547,6 +605,9 @@ class ListingMonitorService:
             conditions.append(ListingMonitorTask.keyword.like(f"%{keyword.strip()}%"))
         if is_enabled is not None:
             conditions.append(ListingMonitorTask.is_enabled.is_(is_enabled))
+        # 按分类筛选（category_id 为 None 时不限制）
+        if category_id is not None:
+            conditions.append(ListingMonitorTask.category_id == category_id)
 
         count_stmt = select(func.count()).select_from(ListingMonitorTask).where(*conditions)
         total = (await self.session.execute(count_stmt)).scalar() or 0
@@ -678,11 +739,13 @@ class ListingMonitorService:
         field: str,
         account_ids: Any,
     ) -> int:
-        """批量修改监控任务的账号字段（监控账号 account_ids 或下单账号 order_account_ids）。
+        """批量修改监控任务的账号字段（采集账号 account_ids 或下单账号 order_account_ids）。
 
         Args:
-            field: 仅允许 "account_ids"（监控/采集账号）或 "order_account_ids"（下单账号）
-            account_ids: 选择的账号ID列表（会校验归属，普通用户只能选自己的账号）
+            field: 仅允许 "account_ids"（采集账号）或 "order_account_ids"（下单账号）
+            account_ids: 选择的账号ID列表（会校验归属，普通用户只能选自己的账号）；
+                传空数组表示清空该字段配置（采集账号清空→回退用户/管理员兜底；
+                下单账号清空→该任务不再下单）。
 
         Returns: 实际更新的任务数
         """
@@ -700,10 +763,8 @@ class ListingMonitorService:
         if not normalized_ids:
             raise ValueError("请选择要修改的监控任务")
 
+        # 允许传空数组清空该字段；非空时按归属校验
         valid_account_ids = await self._normalize_account_ids(owner_id, account_ids)
-        if not valid_account_ids:
-            label = "监控账号" if field == "account_ids" else "下单账号"
-            raise ValueError(f"请至少选择一个{label}")
 
         conditions = self._scope_conditions(owner_id)
         conditions.append(ListingMonitorTask.id.in_(normalized_ids))
@@ -716,6 +777,142 @@ class ListingMonitorService:
 
         await self.session.commit()
         return len(tasks)
+
+    async def batch_update_category(
+        self,
+        owner_id: Optional[int],
+        task_ids: Sequence[int],
+        category_id: Any,
+    ) -> int:
+        """批量修改监控任务的所属分类（分类必填、须存在且当前用户有权使用）。
+
+        Returns: 实际更新的任务数
+        """
+        if category_id is None or category_id == "":
+            raise ValueError("请选择分类")
+        try:
+            category_id = int(category_id)
+        except (TypeError, ValueError):
+            raise ValueError("分类参数不正确")
+        # 校验分类存在且当前用户有权使用（普通用户仅限本人分类）
+        await self._resolve_category(owner_id, category_id)
+
+        normalized_ids: List[int] = []
+        for raw_id in task_ids:
+            try:
+                tid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if tid > 0 and tid not in normalized_ids:
+                normalized_ids.append(tid)
+        if not normalized_ids:
+            raise ValueError("请选择要修改的监控任务")
+
+        conditions = self._scope_conditions(owner_id)
+        conditions.append(ListingMonitorTask.id.in_(normalized_ids))
+        stmt = select(ListingMonitorTask).where(*conditions)
+        tasks = (await self.session.execute(stmt)).scalars().all()
+        now = get_beijing_now_naive()
+        for task in tasks:
+            task.category_id = category_id
+            task.updated_at = now
+
+        await self.session.commit()
+        return len(tasks)
+
+    async def batch_update_dm_content(
+        self,
+        owner_id: Optional[int],
+        task_ids: Sequence[int],
+        dm_content: Any,
+    ) -> int:
+        """批量修改监控任务的私信内容（非空、≤1000字）。
+
+        说明：批量场景仅支持设置统一的私信内容，不支持批量清空（清空请逐条编辑），
+        避免误操作把多条任务的私信内容一次性清掉。
+
+        Returns: 实际更新的任务数
+        """
+        content = (str(dm_content).strip() if dm_content is not None else "")
+        if not content:
+            raise ValueError("请输入私信内容")
+        if len(content) > 1000:
+            raise ValueError("私信内容长度不能超过1000个字符")
+
+        normalized_ids: List[int] = []
+        for raw_id in task_ids:
+            try:
+                tid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if tid > 0 and tid not in normalized_ids:
+                normalized_ids.append(tid)
+        if not normalized_ids:
+            raise ValueError("请选择要修改的监控任务")
+
+        conditions = self._scope_conditions(owner_id)
+        conditions.append(ListingMonitorTask.id.in_(normalized_ids))
+        stmt = select(ListingMonitorTask).where(*conditions)
+        tasks = (await self.session.execute(stmt)).scalars().all()
+        now = get_beijing_now_naive()
+        for task in tasks:
+            task.dm_content = content
+            task.updated_at = now
+
+        await self.session.commit()
+        return len(tasks)
+
+    async def reset_items_dm_failed(
+        self,
+        owner_id: Optional[int],
+        item_ids: Sequence[int],
+    ) -> int:
+        """将选中的"私信失败"采集商品重置为"未私信"状态，等待定时任务重试。
+
+        仅处理 dm_status='failed' 的采集商品（含前端展示的"重试中"与"已放弃"两种）：
+        - 清空私信结果字段（dm_status / dm_fail_reason / dm_account_id）；
+        - 重置私信尝试次数 dm_attempts=0，使其重新满足"采集商品发送私信"定时任务
+          的处理条件（dm_attempts < 上限），等待下次定时任务自动重试；
+        - 保持 is_dm_sent=False（确实未私信）。
+        非"私信失败"状态的商品（未私信/等待重试/已发待确认/私信成功）一律跳过，不受影响。
+
+        Args:
+            owner_id: 归属用户ID（普通用户仅能操作本人数据，管理员为 None 不限）
+            item_ids: 选中的采集商品主键ID列表
+
+        Returns: 实际重置的采集商品数
+        """
+        normalized_ids: List[int] = []
+        for raw_id in item_ids:
+            try:
+                pk = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if pk > 0 and pk not in normalized_ids:
+                normalized_ids.append(pk)
+        if not normalized_ids:
+            raise ValueError("请选择要重置的采集商品")
+
+        conditions = [ListingMonitorItem.id.in_(normalized_ids)]
+        # 多用户数据隔离：普通用户仅能操作本人采集商品（与 list_items 一致）
+        if owner_id is not None:
+            conditions.append(ListingMonitorItem.owner_id == owner_id)
+        # 仅重置"私信失败"的数据，避免误重置正常/成功的商品
+        conditions.append(ListingMonitorItem.dm_status == "failed")
+
+        stmt = select(ListingMonitorItem).where(*conditions)
+        items = (await self.session.execute(stmt)).scalars().all()
+        now = get_beijing_now_naive()
+        for item in items:
+            item.is_dm_sent = False
+            item.dm_status = None
+            item.dm_fail_reason = None
+            item.dm_account_id = None
+            item.dm_attempts = 0
+            item.updated_at = now
+
+        await self.session.commit()
+        return len(items)
 
     async def collect_log_account_cookies(
         self,
@@ -876,6 +1073,31 @@ class ListingMonitorService:
             "total_pages": (total + page_size - 1) // page_size if total else 0,
         }
 
+    async def clear_logs(self, owner_id: Optional[int]) -> Dict[str, Any]:
+        """清空监控日志：仅删除 LOG_RETENTION_DAYS 天之前的记录（日志表直接物理删除）。
+
+        Args:
+            owner_id: 数据隔离范围；普通用户仅清理本人日志，管理员（None）清理全部。
+
+        Returns:
+            {"deleted_count": 删除条数}
+        """
+        cutoff_time = get_beijing_now_naive() - timedelta(days=LOG_RETENTION_DAYS)
+        conditions = [ListingMonitorLog.created_at < cutoff_time]
+        if owner_id is not None:
+            conditions.append(ListingMonitorLog.owner_id == owner_id)
+
+        stmt = delete(ListingMonitorLog).where(*conditions)
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+
+        deleted_count = result.rowcount or 0
+        logger.info(
+            f"[商品监控日志] 已清空 {deleted_count} 条 {LOG_RETENTION_DAYS} 天前的监控日志"
+            f"（owner_id={owner_id}，清理时间界限: {cutoff_time}）"
+        )
+        return {"deleted_count": deleted_count}
+
     async def list_items(
         self,
         owner_id: Optional[int],
@@ -914,15 +1136,19 @@ class ListingMonitorService:
             conditions.append(ListingMonitorItem.item_id == item_id.strip())
         # 私信状态（优先使用 dm_state 多状态筛选；未传时回退旧的 is_dm_sent 布尔筛选）
         # 状态语义与列表展示保持一致：
-        #   not_sent-未私信 / pending-已发待确认 / success-私信成功 / failed-私信失败
+        #   not_sent-未私信 / waiting-等待重试 / pending-已发待确认 / success-私信成功 / failed-私信失败
         if dm_state == "not_sent":
             conditions.append(ListingMonitorItem.is_dm_sent.is_(False))
             conditions.append(
                 or_(
                     ListingMonitorItem.dm_status.is_(None),
-                    ListingMonitorItem.dm_status != "failed",
+                    ListingMonitorItem.dm_status.notin_(["failed", "waiting"]),
                 )
             )
+        elif dm_state == "waiting":
+            # 等待重试：下单账号暂时不可用，已记录原因、未私信、下轮继续重试
+            conditions.append(ListingMonitorItem.is_dm_sent.is_(False))
+            conditions.append(ListingMonitorItem.dm_status == "waiting")
         elif dm_state == "success":
             conditions.append(ListingMonitorItem.dm_status == "success")
         elif dm_state == "failed":
@@ -942,6 +1168,14 @@ class ListingMonitorService:
         #   not_ordered-未下单 / ordered-已下单 / failed-下单失败 / no_account-无可用账号 / duplicate-重复跳过
         if order_state == "ordered":
             conditions.append(ListingMonitorItem.is_ordered.is_(True))
+            # 排除"重复跳过"：其同样标记 is_ordered=True，但展示为"重复跳过"而非"已下单"，
+            # 故"已下单"筛选需排除 duplicate，与列表徽标语义保持一致
+            conditions.append(
+                or_(
+                    ListingMonitorItem.order_status.is_(None),
+                    ListingMonitorItem.order_status != "duplicate",
+                )
+            )
         elif order_state == "duplicate":
             conditions.append(ListingMonitorItem.order_status == "duplicate")
         elif order_state == "no_account":
