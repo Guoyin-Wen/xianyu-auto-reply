@@ -10,6 +10,12 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout 目标分支
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0          # 完整历史，保证 merge 有共同祖先
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Upstream Sync
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
         with:
